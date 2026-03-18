@@ -41,10 +41,14 @@ type VarKind =
 class Scope {
   declare vars: Map<string, { kind: VarKind; used: boolean; node: HasLocation | null }>;
   declare strictScopes: Set<string>[];
+  declare reassigned: Set<string>;
+  declare captured: UnderscoreNode[];
   declare report: Reporter;
   constructor(report: Reporter) {
     this.vars = new Map();
     this.strictScopes = [new Set()];
+    this.reassigned = new Set();
+    this.captured = [];
     this.report = report;
 
     // TODO remove this when regex state objects become less dumb
@@ -157,6 +161,18 @@ export function checkVariableUsage(
       report({
         ruleId: 'unused-declaration',
         message,
+        line: node.location.start.line,
+        column: node.location.start.column,
+      });
+    }
+  }
+
+  for (const node of scope.captured) {
+    const name = node.contents;
+    if (scope.reassigned.has(name)) {
+      report({
+        ruleId: 'set-captured-variable',
+        message: `closure captures ${JSON.stringify(name)}, which is reassigned with "Set"`,
         line: node.location.start.line,
         column: node.location.start.column,
       });
@@ -317,6 +333,7 @@ function walkAlgorithm(
             const name = v.contents;
             scope.use(v);
             acScope.declare(name, v, 'abstract closure capture');
+            scope.captured.push(v);
           }
         }
       }
@@ -324,6 +341,17 @@ function walkAlgorithm(
       // we have a lint rule elsewhere which checks there are substeps for closures, but we can't guarantee that rule hasn't tripped this run, so we still need to guard
       if (step.sublist != null && step.sublist.name === 'ol') {
         walkAlgorithm(algorithmSource, step.sublist, parsed, acScope, report);
+        for (const node of scope.captured) {
+          const name = node.contents;
+          if (acScope.reassigned.has(name)) {
+            report({
+              ruleId: 'set-captured-variable',
+              message: `closure captures ${JSON.stringify(name)}, which is reassigned with "Set" in the closure body`,
+              line: node.location.start.line,
+              column: node.location.start.column,
+            });
+          }
+        }
         for (const [name, { node, kind, used }] of acScope.vars) {
           if (kind === 'abstract closure capture' && !used) {
             report({
@@ -399,6 +427,23 @@ function walkAlgorithm(
             continue;
           }
         }
+      }
+    }
+
+    // "Set _x_" reassignments, to then check if they have been captured by an AC
+    for (let i = 1; i < expr.items.length - 1; ++i) {
+      const prev = expr.items[i - 1];
+      const cur = expr.items[i];
+      const next = expr.items[i + 1];
+      if (
+        isVariable(cur) &&
+        prev.name === 'text' &&
+        /\bset $/i.test(prev.contents) &&
+        // Only record "Set _x_ to" and not "Set _x_.[[Foo]] to"
+        next.name === 'text' &&
+        /^ to\b/.test(next.contents)
+      ) {
+        scope.reassigned.add(cur.contents);
       }
     }
 
